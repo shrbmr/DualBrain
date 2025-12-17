@@ -1,0 +1,5 @@
+streamlit
+groq
+pydantic-ai
+pydantic
+python-dotenv
