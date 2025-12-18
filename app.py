@@ -4,296 +4,364 @@ from pydantic import BaseModel, ValidationError, field_validator
 from pydantic_ai import Agent
 from typing import Optional, List
 import json
-from math import ceil
 import time
+from datetime import datetime, timedelta
+import re
+import statistics
+
+# ======================
+# Config
+# ======================
 
 load_dotenv()
+DEV_MODE = True
 
-DEV_MODE = True  # Set to False in production
+# ======================
+# Models
+# ======================
 
-
-# ----------------------
-# Pydantic Model
-# ----------------------
-class Plan(BaseModel):
-    experience: Optional[str] = None
+class EffortPlan(BaseModel):
+    experience: Optional[str]
     goal: str
     steps: List[str]
     total_effort_minutes: int
-    fulltime_days: int
-    parttime_days: int
-    user_duration_minutes: Optional[int] = None
-    feasibility_comment: Optional[str] = None
-
-    @field_validator("total_effort_minutes")
-    def effort_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError("total_effort_minutes must be > 0")
-        return v
 
     @field_validator("steps")
-    def steps_minimum_three(cls, v):
+    def min_steps(cls, v):
         if len(v) < 3:
-            raise ValueError("steps must contain at least 3 items")
+            raise ValueError("At least 3 steps required")
         return v
 
-# ----------------------
+    @field_validator("total_effort_minutes")
+    def positive_effort(cls, v):
+        if v <= 0:
+            raise ValueError("Effort must be positive")
+        return v
+
+
+class Task(BaseModel):
+    date: str
+    task_description: str
+    allocated_minutes: int
+    guidance: Optional[str] = None  # New field for guidance/materials
+
+
+class FinalPlan(BaseModel):
+    experience: Optional[str]
+    goal: str
+    steps: List[Task]
+    total_effort_minutes: int
+    scheduled_days: int
+    user_duration_minutes: Optional[int]
+    feasibility_comment: str
+
+# ======================
 # AI Agent
-# ----------------------
-system_prompt = """
-You are a detail-oriented mentor and coach. Your task is to generate a practical, achievable plan based on all the information provided by the user. Follow these instructions carefully:
-
-1. Read all user input from a single input box, which may include:
-   - Experience, background, and skills
-   - Goal or objective
-   - Constraints, preferences, or limitations
-   - Target duration or timeline
-
-2. Identify the skills, knowledge, or abilities the user already possesses and note which are relevant to the stated goal.
-
-3. Generate a plan **only for missing skills, knowledge gaps, or steps required to achieve the goal**. Do not include steps for skills the user already has, unless they are necessary for mastery.
-
-4. For each step in the plan:
-   - Assign a realistic duration in minutes that reflects the effort required to gain competence in that skill or complete that task.
-   - Adjust durations based on the user's prior experience: reduce durations for experienced users, but never increase them beyond what is reasonable.
-   - Ensure each step has a **minimum duration of 120 minutes (2 hours)**.
-   - Provide sufficient detail so the user understands **what exactly needs to be done in each step**.
-   - Be conservative and realistic: avoid underestimating the effort required, but do not artificially inflate it.
-
-5. Make sure the total plan is achievable, realistic, and fits within the user's target duration if possible.
-
-6. Compute the following summary metrics:
-   - total_effort_minutes = sum of all step durations
-   - fulltime_days = ceil(total_effort_minutes / (8*60))
-   - parttime_days = ceil(total_effort_minutes / (4*60))
-
-7. Convert any target duration provided by the user (in days, weeks, or months) into minutes and include it as user_duration_minutes. If no target duration is provided, set this to null.
-
-8. Provide a feasibility comment:
-   - "Target duration is feasible" if user_duration_minutes >= total_effort_minutes
-   - "Target duration may require more effort" if user_duration_minutes < total_effort_minutes
-
-9. Include the user’s experience or context in the "experience" field; if none is provided, set it to null.
-
-10. Always return **valid JSON only** following this exact schema:
-{
-  "experience": "<string or null>",
-  "goal": "<string>",
-  "steps": ["<string>", ...],
-  "total_effort_minutes": <integer>,
-  "fulltime_days": <integer>,
-  "parttime_days": <integer>,
-  "user_duration_minutes": <integer or null>,
-  "feasibility_comment": "<string or null>"
-}
-
-11. Do not include any text outside the JSON. Do not explain or justify anything outside the JSON.
-
-12. Ensure that users with relevant prior experience always have **total_effort_minutes less than or equal to beginners** for the same goal, while keeping all step durations realistic.
-
-13. Consider all information provided by the user—including experience, constraints, preferences, and timeline—when generating the plan. Make the plan practical, achievable, and personalized to the user’s context.
-"""
-
+# ======================
 
 agent = Agent(
     model="groq:llama-3.3-70b-versatile",
-    system_prompt=system_prompt
+    system_prompt="""
+You are an expert career planner.
+
+You estimate effort ONLY.
+You ignore deadlines completely.
+
+Return VALID JSON ONLY.
+No markdown. No commentary.
+"""
 )
 
-# ----------------------
+# ======================
 # Helpers
-# ----------------------
+# ======================
 
-def build_aggregation_prompt(
-    plans: list[Plan],
-    original_user_prompt: str
-) -> str:
-    plans_json = [p.model_dump() for p in plans]
+def strip_time_constraints(text: str) -> str:
+    return re.sub(
+        r"in\s+\d+\s+(days?|weeks?|months?)",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
 
-    return f"""
-You are a senior mentor and reviewer.
 
-You are given:
-1) The ORIGINAL user request (ground truth)
-2) Multiple alternative plans generated for the SAME request
+def parse_desired_duration_minutes(text: str, weekly_hours: float) -> Optional[int]:
+    text = text.lower()
 
-Your task is to aggregate the plans into ONE safe, realistic, and achievable plan
-that best satisfies the ORIGINAL user request.
+    if m := re.search(r"(\d+)\s*months?", text):
+        return int(int(m.group(1)) * 4 * weekly_hours * 60)
 
-IMPORTANT PRIORITY ORDER:
-1. The user's stated goal, experience, constraints, and timeline
-2. Consensus across multiple plans
-3. Conservative realism over optimism
+    if m := re.search(r"(\d+)\s*weeks?", text):
+        return int(int(m.group(1)) * weekly_hours * 60)
 
-Rules:
-1. Do NOT invent new steps outside the given plans unless absolutely required
-   to satisfy the user's request.
-2. Merge similar or overlapping steps.
-3. Remove redundant or unnecessary steps.
-4. Be conservative and realistic with total effort.
-5. Ensure at least 3 steps.
-6. Preserve the user's experience, goal, and target duration.
-7. If plans disagree, choose the safer and more realistic option.
-8. Return VALID JSON ONLY using the SAME schema as the original plans.
-9. Do NOT include any explanation outside the JSON.
+    if m := re.search(r"(\d+)\s*days?", text):
+        return int(int(m.group(1)) * (weekly_hours / 7) * 60)
 
-ORIGINAL USER REQUEST:
-\"\"\"{original_user_prompt}\"\"\"
+    return None
 
-PLANS TO AGGREGATE:
-{json.dumps(plans_json, indent=2)}
-"""
 
-def run_ai_call(agent, prompt: str, label: str, dev_logs: list):
-    start_time = time.time()
-    response = agent.run_sync(prompt)
-    duration = round(time.time() - start_time, 2)
-
-    output = response.output.strip()
+def run_ai(agent, prompt, label, logs):
+    start = time.time()
+    result = agent.run_sync(prompt)
+    duration = round(time.time() - start, 2)
+    output = result.output.strip()
 
     if output.startswith("```"):
         output = "\n".join(output.splitlines()[1:-1])
 
     if DEV_MODE:
-        dev_logs.append({
+        logs.append({
             "label": label,
             "prompt": prompt,
             "response": output,
-            "duration_seconds": duration,
+            "duration": duration
         })
 
     return output
 
-# ----------------------
-# Streamlit UI
-# ----------------------
-st.title("Planimal - Your Blueprint for Goals")
+
+def deterministic_schedule(
+    steps: List[str],
+    total_minutes: int,
+    start_date: datetime,
+    daily_capacity_minutes: int
+) -> List[Task]:
+    tasks = []
+    minutes_remaining = total_minutes
+    current_date = start_date
+    step_index = 0
+
+    while minutes_remaining > 0:
+        minutes_today = min(daily_capacity_minutes, minutes_remaining)
+        tasks.append(Task(
+            date=current_date.isoformat(),
+            task_description=steps[step_index % len(steps)],
+            allocated_minutes=minutes_today
+        ))
+        minutes_remaining -= minutes_today
+        current_date += timedelta(days=1)
+        step_index += 1
+
+    return tasks
+
+
+def generate_goal_overview(agent, user_context, logs):
+    prompt = f"""
+You are an expert career/goal planner.
+
+User context:
+{user_context}
+
+Task:
+1. List the essential knowledge, skills, or capabilities needed to achieve the goal.
+2. Identify knowledge or skills the user likely does NOT know based on their experience.
+3. Return valid JSON with two keys:
+   {{
+       "required_knowledge": [string],
+       "skills_to_learn": [string]
+   }}
+
+Return JSON ONLY, no commentary.
+"""
+    raw = run_ai(agent, prompt, "Generic Goal Overview", logs)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"required_knowledge": [], "skills_to_learn": []}
+
+
+def generate_task_guidance(agent, task_description, logs):
+    """
+    Generates guidance, tips, or materials (online courses, books) for a task.
+    """
+    prompt = f"""
+You are an expert career/goal planner.
+
+Task description:
+{task_description}
+
+Provide practical guidance, learning resources, or tips to accomplish this task.  
+Return JSON with a single key:
+{{
+    "guidance": string
+}}
+
+Return JSON ONLY.
+"""
+    raw = run_ai(agent, prompt, f"Task Guidance: {task_description}", logs)
+    try:
+        return json.loads(raw).get("guidance", "")
+    except Exception:
+        return ""
+
+# ======================
+# Sidebar
+# ======================
+
+with st.sidebar:
+    start_date = st.date_input("Start Date", datetime.today())
+    st.write("---")
+    st.header("Availability per Day (hours)")
+
+    weekday_hours = {
+        "Monday": st.number_input("Monday", 0.0, 24.0, 4.0),
+        "Tuesday": st.number_input("Tuesday", 0.0, 24.0, 4.0),
+        "Wednesday": st.number_input("Wednesday", 0.0, 24.0, 4.0),
+        "Thursday": st.number_input("Thursday", 0.0, 24.0, 4.0),
+        "Friday": st.number_input("Friday", 0.0, 24.0, 4.0),
+        "Saturday": st.number_input("Saturday", 0.0, 24.0, 0.0),
+        "Sunday": st.number_input("Sunday", 0.0, 24.0, 0.0),
+    }
+
+weekly_hours = sum(weekday_hours.values())
+daily_capacity_minutes = int(max(weekday_hours.values()) * 60)
+
+# ======================
+# Main UI
+# ======================
+st.set_page_config(
+    page_title="Planimal – Logical Goal Planner",
+    layout="wide"  # wide layout increases content width
+)
+
+st.title("Planimal – Logical Goal Planner")
 
 user_input = st.text_area(
     "Enter your goal, experience, constraints, preferences, and any other context",
-    "I am an experienced Business Analyst. I want to be AI PM in 2 months."
+    "I am an experienced Business Analyst. I want to be AI PM in 6 days."
 )
 
 if st.button("Generate Plan"):
-    if user_input.strip():
-        with st.spinner("Thinking..."):
+    with st.spinner("Planning logically..."):
+        dev_logs = []
+
+        # ---- Step 0: Generic Goal Overview
+        overview = generate_goal_overview(agent, user_input, dev_logs)
+
+        st.markdown("### 🧭 Overview")
+        st.markdown("""
+**Explanation:**  
+- **Essential knowledge / capabilities:** Things you already need to know or understand deeply to succeed in this goal.  
+- **Skills or areas to learn:** Knowledge gaps or practical skills you likely need to acquire to achieve the goal effectively.
+""")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### ✅ Essential knowledge / capabilities")
+            for item in overview["required_knowledge"]:
+                st.markdown(f"- {item}")
+        with col2:
+            st.markdown("#### 🎯 Skills or areas to learn")
+            for item in overview["skills_to_learn"]:
+                st.markdown(f"- {item}")
+
+        # ---- Step 1: Effort estimation
+        clean_input = strip_time_constraints(user_input)
+        effort_plans = []
+
+        for i in range(5):
+            raw = run_ai(
+                agent,
+                f"""
+Estimate the TOTAL EFFORT required.
+
+Ignore timelines and deadlines.
+
+Schema:
+{{
+  "experience": string | null,
+  "goal": string,
+  "steps": [string, string, string],
+  "total_effort_minutes": number
+}}
+
+USER CONTEXT:
+{clean_input}
+""",
+                f"Effort Gen #{i+1}",
+                dev_logs
+            )
+
             try:
-                input_text = user_input.strip()
-                dev_logs = []
+                effort_plans.append(EffortPlan(**json.loads(raw)))
+            except Exception:
+                continue
 
-                # ----------------------
-                # 1) Generate multiple candidate plans (3 calls)
-                # ----------------------
-                plans = []
-                MAX_RUNS = 3
+        if len(effort_plans) < 2:
+            st.error("Could not reliably estimate effort. Try again.")
+            st.stop()
 
-                for i in range(MAX_RUNS):
-                    raw_output = run_ai_call(
-                        agent=agent,
-                        prompt=f"Generate a practical plan based on this input: {input_text}",
-                        label=f"Generation Call #{i+1}",
-                        dev_logs=dev_logs
-                    )
+        locked_effort = int(statistics.median(
+            p.total_effort_minutes for p in effort_plans
+        ))
 
-                    try:
-                        plan_data = json.loads(raw_output)
-                        validated_plan = Plan(**plan_data)
-                        plans.append(validated_plan)
-                    except (json.JSONDecodeError, ValidationError):
-                        continue
+        base_plan = effort_plans[0]
+        base_plan.total_effort_minutes = locked_effort
 
-                # ----------------------
-                # 2) Safety check
-                # ----------------------
-                if len(plans) < 2:
-                    st.error("AI responses were inconsistent. Please try again.")
-                    st.stop()
+        # ---- Step 2: Deterministic scheduling
+        tasks = deterministic_schedule(
+            base_plan.steps,
+            base_plan.total_effort_minutes,
+            start_date,
+            daily_capacity_minutes
+        )
 
-                # ----------------------
-                # 3) Aggregation call (4th call)
-                # ----------------------
-                aggregation_prompt = build_aggregation_prompt(
-                    plans=plans,
-                    original_user_prompt=input_text
-                )
+        # ---- Step 2b: Add guidance/materials per task
+        for task in tasks:
+            task.guidance = generate_task_guidance(agent, task.task_description, dev_logs)
 
-                raw_output = run_ai_call(
-                    agent=agent,
-                    prompt=aggregation_prompt,
-                    label="Aggregation Call",
-                    dev_logs=dev_logs
-                )
+        scheduled_days = len(tasks)
 
-                try:
-                    aggregated_data = json.loads(raw_output)
-                    plan = Plan(**aggregated_data)
-                except (json.JSONDecodeError, ValidationError):
-                    st.error("Failed to safely aggregate AI responses.")
-                    st.stop()
+        # ---- Step 3: Feasibility
+        user_duration_minutes = parse_desired_duration_minutes(
+            user_input,
+            weekly_hours
+        )
 
-                # ----------------------
-                # 4) Deterministic recompute
-                # ----------------------
-                plan = plan.copy(
-                    update={
-                        "fulltime_days": ceil(plan.total_effort_minutes / (8 * 60)),
-                        "parttime_days": ceil(plan.total_effort_minutes / (4 * 60)),
-                        "feasibility_comment": (
-                            "Target duration is feasible"
-                            if plan.user_duration_minutes
-                            and plan.user_duration_minutes >= plan.total_effort_minutes
-                            else "Target duration may require more effort"
-                        ),
-                    }
-                )
+        if user_duration_minutes is None:
+            feasibility = "No desired timeline provided"
+        elif user_duration_minutes >= locked_effort:
+            feasibility = "Feasible"
+        else:
+            deficit = locked_effort - user_duration_minutes
+            feasibility = f"Infeasible – short by {deficit/60:.1f} hours"
 
-                # ----------------------
-                # 5) Display final plan
-                # ----------------------
-                if plan.experience:
-                    st.subheader("User Experience / Context")
-                    st.write(plan.experience)
+        final_plan = FinalPlan(
+            experience=base_plan.experience,
+            goal=base_plan.goal,
+            steps=tasks,
+            total_effort_minutes=locked_effort,
+            scheduled_days=scheduled_days,
+            user_duration_minutes=user_duration_minutes,
+            feasibility_comment=feasibility
+        )
 
-                st.subheader("Goal")
-                st.write(plan.goal)
+        # ---- Step 4: Plan Summary
+        st.markdown(f"""
+### ℹ️ Plan Summary
 
-                st.subheader("Steps")
-                for i, step in enumerate(plan.steps, 1):
-                    st.write(f"{i}. {step}")
+**Intrinsic effort required:** {locked_effort/60:.1f} hours  
+**Scheduled duration (capacity-based):** {scheduled_days} days  
+**Feasibility:** **{feasibility}**
+""")
 
-                st.subheader("Estimated Total Effort")
-                st.write(f"{plan.total_effort_minutes:,} minutes")
+        st.dataframe(
+            [
+                {
+                    "Date": t.date,
+                    "Task": t.task_description,
+                    "Minutes": t.allocated_minutes,
+                    "Guidance / Material": t.guidance
+                } for t in final_plan.steps
+            ],
+            use_container_width=True
+        )
 
-                st.subheader("Estimated Timeline")
-                st.write(f"Full-time (8 hrs/day): {plan.fulltime_days} days")
-                st.write(f"Part-time (4 hrs/day): {plan.parttime_days} days")
-
-                if plan.user_duration_minutes is not None:
-                    st.subheader("User Suggested Duration")
-                    st.write(plan.user_duration_minutes)
-
-                if plan.feasibility_comment:
-                    st.subheader("Feasibility Comment")
-                    st.write(plan.feasibility_comment)
-
-                # ----------------------
-                # 6) DEV MODE: Observability UI
-                # ----------------------
-                if DEV_MODE:
-                    st.divider()
-                    st.subheader("🛠️ Dev Mode – AI Call Trace")
-
-                    for log in dev_logs:
-                        with st.expander(
-                            f"{log['label']} — {log['duration_seconds']}s"
-                        ):
-                            st.markdown("**Prompt**")
-                            st.code(log["prompt"], language="text")
-
-                            st.markdown("**Response**")
-                            st.code(log["response"], language="json")
-
-            except ValidationError as ve:
-                st.error(f"No-BS validation error: {str(ve)}")
-    else:
-        st.warning("Please enter your goal and context!")
+        # ---- Step 5: Dev logs
+        if DEV_MODE:
+            st.divider()
+            st.subheader("🛠 Dev Trace")
+            for log in dev_logs:
+                with st.expander(log["label"]):
+                    st.code(log["prompt"])
+                    st.code(log["response"], language="json")
